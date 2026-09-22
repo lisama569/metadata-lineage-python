@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""本地开发入口：uv run fastapi dev main.py"""
 
-app = FastAPI()
+from metadata_lineage.api import app  # noqa: F401
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
