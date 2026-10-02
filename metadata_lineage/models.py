@@ -173,6 +173,38 @@ class AuditEntry:
     revision_after: int | None
 
 
+class BatchItemStatus(str, enum.Enum):
+    """批量更新中逐条结果状态。"""
+
+    SUCCESS = "SUCCESS"                    # 该条随整批一起落库
+    CONFLICT_REVISION = "CONFLICT_REVISION"  # 版本号过期
+    VALIDATION_ERROR = "VALIDATION_ERROR"  # 该条输入不合法
+    ENTITY_NOT_FOUND = "ENTITY_NOT_FOUND"  # 实体不存在
+    BATCH_ABORTED = "BATCH_ABORTED"        # 本条自身通过校验，但因同批其它条目失败而整批回滚
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    """批量更新中单个实体的尝试结果。"""
+
+    index: int
+    entity_id: str
+    status: str
+    reason_code: str | None
+    detail: str | None
+    current_revision: int | None   # 校验时观察到的 revision（找不到实体时为 None）
+    revision_after: int | None     # 仅整批提交成功时有值
+
+
+@dataclass(frozen=True)
+class BatchUpdateResult:
+    """整批结果：committed=False 时所有条目均不落库。"""
+
+    batch_id: str
+    committed: bool
+    results: list[BatchItemResult]
+
+
 class ServiceError(Exception):
     """服务层拒绝异常，携带可区分错误码与明细。"""
 

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .models import ErrorCode, FieldSpec, FieldType, Ref, ServiceError
-from .service import CatalogService
+from .service import UNSET, BatchOwnerTagsItem, CatalogService
 
 _CONFLICT = {
     ErrorCode.ENTITY_ALREADY_EXISTS,
@@ -76,10 +76,27 @@ class LineageIn(BaseModel):
 
 class OwnerTagsIn(BaseModel):
     expected_revision: int
+    # owner 缺省=未提及（保持原值）；显式 null=清空；字符串=设置
     owner: str | None = None
     add_tags: list[str] = Field(default_factory=list)
     remove_tags: list[str] = Field(default_factory=list)
+    # 缺省=不改动标签；传 [] = 整体清空；显式 null 非法
+    replace_tags: list[str] | None = None
     actor: str = "anonymous"
+
+
+class OwnerTagsBatchItemIn(BaseModel):
+    entity_id: str
+    expected_revision: int
+    owner: str | None = None
+    add_tags: list[str] = Field(default_factory=list)
+    remove_tags: list[str] = Field(default_factory=list)
+    replace_tags: list[str] | None = None
+    actor: str = "anonymous"
+
+
+class OwnerTagsBatchIn(BaseModel):
+    items: list[OwnerTagsBatchItemIn]
 
 
 def _field_out(f: Any) -> dict[str, Any]:
@@ -150,6 +167,37 @@ def create_app(service: CatalogService | None = None) -> FastAPI:
     def svc() -> CatalogService:
         return app.state.service
 
+    @app.post("/entities/owner-tags:batch")
+    def batch_update_owner_tags(body: OwnerTagsBatchIn):
+        items: list[BatchOwnerTagsItem] = []
+        for it in body.items:
+            fs = it.model_fields_set
+            items.append(BatchOwnerTagsItem(
+                entity_id=it.entity_id,
+                expected_revision=it.expected_revision,
+                owner=it.owner if "owner" in fs else UNSET,
+                add_tags=frozenset(it.add_tags),
+                remove_tags=frozenset(it.remove_tags),
+                replace_tags=(frozenset(it.replace_tags)
+                              if it.replace_tags is not None else None)
+                if "replace_tags" in fs else UNSET,
+                actor=it.actor,
+            ))
+        result = svc().batch_update_owner_tags(items)
+        return {
+            "batch_id": result.batch_id,
+            "committed": result.committed,
+            "results": [{
+                "index": x.index,
+                "entity_id": x.entity_id,
+                "status": x.status,
+                "reason_code": x.reason_code,
+                "detail": x.detail,
+                "current_revision": x.current_revision,
+                "revision_after": x.revision_after,
+            } for x in result.results],
+        }
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -197,25 +245,45 @@ def create_app(service: CatalogService | None = None) -> FastAPI:
         return _edge_out(edge)
 
     @app.get("/lineage/impact")
-    def impact(entity_id: str, field_name: str, version: int | None = None):
+    def impact(
+        entity_id: str, field_name: str, version: int | None = None,
+        max_upstream_depth: int | None = None,
+        max_downstream_depth: int | None = None,
+        max_upstream_nodes: int | None = None,
+        max_downstream_nodes: int | None = None,
+    ):
         ref = svc().resolve_ref(entity_id, field_name, version)
-        result = svc().impact(ref)
+        result = svc().impact(
+            ref,
+            max_upstream_depth=max_upstream_depth,
+            max_downstream_depth=max_downstream_depth,
+            max_upstream_nodes=max_upstream_nodes,
+            max_downstream_nodes=max_downstream_nodes,
+        )
         return {
             "ref": _ref_out(ref),
             "upstream": [_ref_out(r) for r in result.upstream],
             "downstream": [_ref_out(r) for r in result.downstream],
             "active_edges": [_edge_out(e) for e in result.active_edges],
             "dangling_edges": [_edge_out(e) for e in result.dangling_edges],
+            "truncated": result.truncated,
+            "upstream_truncated": result.upstream_truncated,
+            "downstream_truncated": result.downstream_truncated,
+            "limits": result.limits,
         }
 
     @app.put("/entities/{entity_id}/owner-tags")
     def update_owner_tags(entity_id: str, body: OwnerTagsIn):
+        fields_set = body.model_fields_set
         entity, revision = svc().update_owner_tags(
             entity_id,
             expected_revision=body.expected_revision,
-            owner=body.owner,
+            owner=body.owner if "owner" in fields_set else UNSET,
             add_tags=set(body.add_tags),
             remove_tags=set(body.remove_tags),
+            replace_tags=(set(body.replace_tags)
+                          if body.replace_tags is not None else None)
+            if "replace_tags" in fields_set else UNSET,
             actor=body.actor,
         )
         return _entity_out(entity) | {"revision": revision}
