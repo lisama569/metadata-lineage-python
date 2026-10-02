@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .models import ErrorCode, FieldSpec, FieldType, Ref, ServiceError
-from .service import CatalogService
+from .service import _UNSET, CatalogService, OwnerTagsUpdate
 
 _CONFLICT = {
     ErrorCode.ENTITY_ALREADY_EXISTS,
@@ -75,11 +75,37 @@ class LineageIn(BaseModel):
 
 
 class OwnerTagsIn(BaseModel):
+    """属主/标签更新。
+
+    语义约定（“没提到”≠“清空”）：
+    - owner 字段不出现 → 属主保持原值；显式 "owner": null → 清空属主；
+    - set_tags 出现 → 标签整体替换为该集合（与 add/remove 互斥）；
+    - set_tags 不出现 → 按 add_tags/remove_tags 做增量改动；
+    - 三者都不出现 → 标签保持原值。
+    """
+
     expected_revision: int
     owner: str | None = None
+    set_tags: list[str] | None = None
     add_tags: list[str] = Field(default_factory=list)
     remove_tags: list[str] = Field(default_factory=list)
     actor: str = "anonymous"
+
+    def owner_arg(self) -> object:
+        """区分“未提供 owner”（_UNSET，保持原值）与显式 null（清空）。"""
+        return self.owner if "owner" in self.model_fields_set else _UNSET
+
+    def set_tags_arg(self) -> object:
+        return (set(self.set_tags) if self.set_tags is not None
+                and "set_tags" in self.model_fields_set else _UNSET)
+
+
+class OwnerTagsBatchItemIn(OwnerTagsIn):
+    entity_id: str
+
+
+class OwnerTagsBatchIn(BaseModel):
+    items: list[OwnerTagsBatchItemIn]
 
 
 def _field_out(f: Any) -> dict[str, Any]:
@@ -197,15 +223,17 @@ def create_app(service: CatalogService | None = None) -> FastAPI:
         return _edge_out(edge)
 
     @app.get("/lineage/impact")
-    def impact(entity_id: str, field_name: str, version: int | None = None):
+    def impact(entity_id: str, field_name: str, version: int | None = None,
+               max_depth: int | None = None, max_nodes: int | None = None):
         ref = svc().resolve_ref(entity_id, field_name, version)
-        result = svc().impact(ref)
+        result = svc().impact(ref, max_depth=max_depth, max_nodes=max_nodes)
         return {
             "ref": _ref_out(ref),
             "upstream": [_ref_out(r) for r in result.upstream],
             "downstream": [_ref_out(r) for r in result.downstream],
             "active_edges": [_edge_out(e) for e in result.active_edges],
             "dangling_edges": [_edge_out(e) for e in result.dangling_edges],
+            "truncated": result.truncated,
         }
 
     @app.put("/entities/{entity_id}/owner-tags")
@@ -213,12 +241,45 @@ def create_app(service: CatalogService | None = None) -> FastAPI:
         entity, revision = svc().update_owner_tags(
             entity_id,
             expected_revision=body.expected_revision,
-            owner=body.owner,
+            owner=body.owner_arg(),
+            set_tags=body.set_tags_arg(),
             add_tags=set(body.add_tags),
             remove_tags=set(body.remove_tags),
             actor=body.actor,
         )
         return _entity_out(entity) | {"revision": revision}
+
+    @app.post("/owner-tags/batch")
+    def batch_update_owner_tags(body: OwnerTagsBatchIn):
+        """批量原子更新：整批要么全部生效、要么全部不落库。
+
+        始终返回 200，逐条结论在 results 中；applied=false 表示整批未落库。
+        """
+        result = svc().batch_update_owner_tags([
+            OwnerTagsUpdate(
+                entity_id=item.entity_id,
+                expected_revision=item.expected_revision,
+                owner=item.owner_arg(),
+                set_tags=item.set_tags_arg(),
+                add_tags=frozenset(item.add_tags),
+                remove_tags=frozenset(item.remove_tags),
+                actor=item.actor,
+            )
+            for item in body.items
+        ])
+        return {
+            "applied": result.applied,
+            "results": [
+                {
+                    "entity_id": r.entity_id,
+                    "status": r.status,
+                    "reason_code": r.reason_code,
+                    "revision": r.revision,
+                    "detail": r.detail,
+                }
+                for r in result.results
+            ],
+        }
 
     @app.get("/audit")
     def audit_log(limit: int | None = None):

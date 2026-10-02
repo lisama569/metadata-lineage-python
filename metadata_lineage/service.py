@@ -55,12 +55,53 @@ class ImpactResult:
 
     active_edges：当前有效结构上参与传播的边。
     dangling_edges：因字段被删除（强制演进）而断开的边；不参与遍历，永不静默删除。
+    truncated：是否因触到容量上限（max_depth / max_nodes）而被截断。
     """
 
     upstream: list[Ref]
     downstream: list[Ref]
     active_edges: list[LineageEdge]
     dangling_edges: list[LineageEdge]
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class OwnerTagsUpdate:
+    """批量属主/标签更新中的单条改动。
+
+    owner / set_tags 的“未提到”用 _UNSET 表示；owner=None 表示显式清空属主。
+    """
+
+    entity_id: str
+    expected_revision: int
+    owner: object = _UNSET
+    set_tags: object = _UNSET
+    add_tags: frozenset[str] = frozenset()
+    remove_tags: frozenset[str] = frozenset()
+    actor: str = "anonymous"
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    """批量更新中单个实体的逐条结论。
+
+    status: success | conflict | validation_failed | not_found | aborted
+    （aborted = 本条自身合法，但因整批原子性未落库）。
+    """
+
+    entity_id: str
+    status: str
+    reason_code: str | None
+    revision: int | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """批量原子更新结论：applied=False 时任何改动都未落库。"""
+
+    applied: bool
+    results: list[BatchItemResult]
 
 
 def _type_change(old: str, new: str) -> ErrorCode | None:
@@ -444,7 +485,20 @@ class CatalogService:
                     queue.append(nxt)
         return False
 
-    def impact(self, ref: Ref) -> ImpactResult:
+    def impact(self, ref: Ref, *, max_depth: int | None = None,
+               max_nodes: int | None = None) -> ImpactResult:
+        """上下游影响分析，可选容量上限。
+
+        - max_depth：沿每个方向最多追多少层（1 = 仅直接邻居）；
+        - max_nodes：每个方向最多返回多少个节点。
+        触到任一上限即截断并在结果中标记 truncated=True；遍历顺序按
+        edge_id 排序的 BFS，同样输入多次调用结论一致。悬空边不参与遍历。
+        """
+        for name, limit in (("max_depth", max_depth), ("max_nodes", max_nodes)):
+            if limit is not None and (not isinstance(limit, int) or limit < 1):
+                raise ServiceError(
+                    ErrorCode.VALIDATION_ERROR,
+                    f"{name} must be a positive integer, got {limit!r}")
         try:
             self._validate_ref_current(ref)
         except ServiceError:
@@ -455,7 +509,7 @@ class CatalogService:
             if not e.active and (e.src == ref or e.dst == ref)
         ]
 
-        def walk(forward: bool) -> tuple[list[Ref], list[LineageEdge]]:
+        def walk(forward: bool) -> tuple[list[Ref], list[LineageEdge], bool]:
             adj: dict[Ref, list[tuple[LineageEdge, Ref]]] = {}
             for e in sorted(active, key=lambda x: x.edge_id):
                 if forward:
@@ -465,20 +519,32 @@ class CatalogService:
             order: list[Ref] = []
             used_edges: list[LineageEdge] = []
             seen = {ref}
-            queue: deque[Ref] = deque([ref])
+            queue: deque[tuple[Ref, int]] = deque([(ref, 0)])
+            truncated = False
             while queue:
-                cur = queue.popleft()
-                for edge, nxt in adj.get(cur, []):
+                cur, depth = queue.popleft()
+                if max_nodes is not None and len(order) >= max_nodes:
+                    truncated = True  # 队列中仍有未返回的节点
+                    break
+                neighbors = adj.get(cur, [])
+                if max_depth is not None and depth >= max_depth:
+                    if neighbors:
+                        truncated = True  # 更深一层不再展开
+                    continue
+                for edge, nxt in neighbors:
+                    if max_nodes is not None and len(order) >= max_nodes:
+                        truncated = True
+                        break
                     if edge not in used_edges:
                         used_edges.append(edge)
                     if nxt not in seen:
                         seen.add(nxt)
                         order.append(nxt)
-                        queue.append(nxt)
-            return order, used_edges
+                        queue.append((nxt, depth + 1))
+            return order, used_edges, truncated
 
-        upstream, up_edges = walk(forward=False)
-        downstream, down_edges = walk(forward=True)
+        upstream, up_edges, up_trunc = walk(forward=False)
+        downstream, down_edges, down_trunc = walk(forward=True)
         edge_ids = {e.edge_id for e in up_edges} | {e.edge_id for e in down_edges}
         active_edges = [
             e for e in sorted(active, key=lambda x: x.edge_id)
@@ -489,36 +555,75 @@ class CatalogService:
             downstream=downstream,
             active_edges=active_edges,
             dangling_edges=sorted(dangling, key=lambda x: x.edge_id),
+            truncated=up_trunc or down_trunc,
         )
 
     # ---- 属主与标签（乐观锁） -------------------------------------
+    @staticmethod
+    def _validate_owner_tags_input(
+        owner: object, set_tags: object,
+        add_tags: set[str], remove_tags: set[str],
+    ) -> None:
+        """属主/标签更新的输入校验（单个与批量共用）。
+
+        - set_tags（整体替换）与 add/remove（增量改动）互斥；
+        - 同一标签不得同时出现在 add 与 remove；
+        - 标签必须非空；属主若显式给出必须是非空字符串或 None（清空）。
+        """
+        if set_tags is not _UNSET and (add_tags or remove_tags):
+            raise ServiceError(
+                ErrorCode.VALIDATION_ERROR,
+                "set_tags (full replace) cannot be combined with "
+                "add_tags/remove_tags (incremental)")
+        if add_tags & remove_tags:
+            raise ServiceError(
+                ErrorCode.VALIDATION_ERROR,
+                "same tag appears in both add_tags and remove_tags")
+        all_tags = set(add_tags | remove_tags)
+        if set_tags is not _UNSET:
+            all_tags |= set(set_tags)  # type: ignore[arg-type]
+        if any(not t or not t.strip() for t in all_tags):
+            raise ServiceError(
+                ErrorCode.VALIDATION_ERROR, "tag must be non-empty")
+        if owner is not _UNSET and owner is not None:
+            if not isinstance(owner, str) or not owner.strip():
+                raise ServiceError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "owner must be a non-empty string, null (clear), "
+                    "or omitted (keep)")
+
+    @staticmethod
+    def _apply_owner_tags(
+        entity: Entity, *, owner: object, set_tags: object,
+        add_tags: set[str], remove_tags: set[str],
+    ) -> None:
+        """按“未提到即保持原值”的语义应用属主/标签改动（就地修改）。"""
+        if owner is not _UNSET:
+            entity.owner = None if owner is None else str(owner)
+        if set_tags is not _UNSET:
+            entity.tags = set(set_tags)  # type: ignore[arg-type]
+        else:
+            entity.tags = (entity.tags | add_tags) - remove_tags
+
     def update_owner_tags(
         self, entity_id: str, *, expected_revision: int,
-        owner: str | object = _UNSET, add_tags: set[str] | None = None,
+        owner: str | None | object = _UNSET,
+        set_tags: set[str] | object = _UNSET,
+        add_tags: set[str] | None = None,
         remove_tags: set[str] | None = None, actor: str = "anonymous",
     ) -> tuple[Entity, int]:
         action = "update_owner_tags"
         add_tags = set(add_tags or ())
         remove_tags = set(remove_tags or ())
-        if add_tags & remove_tags:
+        try:
+            self._validate_owner_tags_input(owner, set_tags, add_tags, remove_tags)
+        except ServiceError as e:
             self._audit(
                 actor=actor, action=action, target=entity_id,
-                status="validation_failed", reason_code=ErrorCode.VALIDATION_ERROR,
-                detail={"message": "same tag appears in both add and remove",
-                        "tags": sorted(add_tags & remove_tags)},
+                status="validation_failed", reason_code=e.code,
+                detail={"message": e.detail or ""},
             )
-            raise ServiceError(
-                ErrorCode.VALIDATION_ERROR,
-                "same tag appears in both add_tags and remove_tags")
-        bad = [t for t in (add_tags | remove_tags) if not t or not t.strip()]
-        if bad:
-            self._audit(
-                actor=actor, action=action, target=entity_id,
-                status="validation_failed", reason_code=ErrorCode.VALIDATION_ERROR,
-                detail={"message": "tag must be non-empty"},
-            )
-            raise ServiceError(
-                ErrorCode.VALIDATION_ERROR, "tag must be non-empty")
+            raise
 
         with self.store.lock:
             entity = self.store.get_entity(entity_id)
@@ -537,9 +642,9 @@ class CatalogService:
                     revision_before=rev_before,
                 )
 
-            if owner is not _UNSET:
-                entity.owner = None if owner is None else str(owner)
-            entity.tags = (entity.tags | add_tags) - remove_tags
+            self._apply_owner_tags(
+                entity, owner=owner, set_tags=set_tags,
+                add_tags=add_tags, remove_tags=remove_tags)
             entity.revision = rev_before + 1
             self.store.put_entity(entity)
             self._audit(
@@ -548,6 +653,125 @@ class CatalogService:
                 revision_before=rev_before, revision_after=entity.revision,
             )
             return entity, entity.revision
+
+    def batch_update_owner_tags(
+        self, items: list[OwnerTagsUpdate],
+    ) -> BatchResult:
+        """批量原子更新：整批要么全部落库、要么全部不生效。
+
+        每个实体按自己的 expected_revision 做乐观锁校验；任何一条失败
+        （版本过期 / 输入不合法 / 实体不存在）都会使整批不落库，但每条
+        尝试都会留下独立审计，返回值逐条给出结论。
+        """
+        action = "batch_update_owner_tags"
+        if not items:
+            self._reject(ErrorCode.VALIDATION_ERROR, actor="anonymous",
+                         action=action, target="<batch>",
+                         detail="batch must contain at least one item")
+
+        # 同一实体在一批中出现两次：语义含糊，两条都判为校验失败
+        counts: dict[str, int] = {}
+        for it in items:
+            counts[it.entity_id] = counts.get(it.entity_id, 0) + 1
+
+        results: list[BatchItemResult] = []
+        # (entity, item) 仅收集自身校验通过的条目，待整批一致通过后才落库
+        pending: list[tuple[Entity, OwnerTagsUpdate]] = []
+
+        with self.store.lock:
+            for it in items:
+                fail: tuple[str, ErrorCode, str] | None = None
+                entity: Entity | None = None
+                rev_before: int | None = None
+
+                if counts[it.entity_id] > 1:
+                    fail = ("validation_failed", ErrorCode.VALIDATION_ERROR,
+                            "entity appears more than once in the same batch")
+                else:
+                    try:
+                        self._validate_owner_tags_input(
+                            it.owner, it.set_tags,
+                            set(it.add_tags), set(it.remove_tags))
+                    except ServiceError as e:
+                        fail = ("validation_failed", e.code, e.detail or "")
+                    else:
+                        entity = self.store.get_entity(it.entity_id)
+                        if entity is None:
+                            fail = ("not_found", ErrorCode.ENTITY_NOT_FOUND,
+                                    f"entity '{it.entity_id}' not found")
+                        else:
+                            rev_before = entity.revision
+                            if rev_before != it.expected_revision:
+                                fail = (
+                                    "conflict", ErrorCode.CONFLICT_REVISION,
+                                    f"stale write: expected revision "
+                                    f"{it.expected_revision}, current is "
+                                    f"{rev_before}")
+
+                if fail is not None:
+                    status, code, msg = fail
+                    results.append(BatchItemResult(
+                        entity_id=it.entity_id, status=status,
+                        reason_code=code.value, revision=None, detail=msg))
+                    self._audit(
+                        actor=it.actor, action=action, target=it.entity_id,
+                        status=("validation_failed" if status
+                                == "validation_failed" else "rejected"),
+                        reason_code=code, detail={"message": msg},
+                        revision_before=rev_before,
+                    )
+                else:
+                    assert entity is not None and rev_before is not None
+                    pending.append((entity, it))
+                    results.append(BatchItemResult(
+                        entity_id=it.entity_id, status="success",
+                        reason_code=None, revision=rev_before + 1,
+                        detail="applied"))
+
+            applied = len(pending) == len(items)
+            if applied:
+                # 整批一致通过：在同一把锁内逐条应用并落库
+                for entity, it in pending:
+                    self._apply_owner_tags(
+                        entity, owner=it.owner, set_tags=it.set_tags,
+                        add_tags=set(it.add_tags),
+                        remove_tags=set(it.remove_tags))
+                    entity.revision += 1
+                    self.store.put_entity(entity)
+                    self._audit(
+                        actor=it.actor, action=action, target=it.entity_id,
+                        status="success",
+                        detail={"owner": entity.owner,
+                                "tags": sorted(entity.tags)},
+                        revision_before=it.expected_revision,
+                        revision_after=entity.revision,
+                    )
+            else:
+                # 整批不落库：自身合法的条目标记为 aborted，同样逐条留痕
+                aborted_ids = {e.entity_id for e, _it in pending}
+                results = [
+                    BatchItemResult(
+                        entity_id=r.entity_id,
+                        status=("aborted" if r.entity_id in aborted_ids
+                                else r.status),
+                        reason_code=(ErrorCode.BATCH_ABORTED.value
+                                     if r.entity_id in aborted_ids
+                                     else r.reason_code),
+                        revision=None,
+                        detail=("batch aborted: no change persisted"
+                                if r.entity_id in aborted_ids else r.detail),
+                    )
+                    for r in results
+                ]
+                for entity, it in pending:
+                    self._audit(
+                        actor=it.actor, action=action, target=it.entity_id,
+                        status="rejected", reason_code=ErrorCode.BATCH_ABORTED,
+                        detail={"message": "batch aborted: no change persisted"},
+                        revision_before=it.expected_revision,
+                    )
+
+            return BatchResult(applied=applied, results=results)
 
     # ---- 审计 -----------------------------------------------------
     def audit_log(self) -> list[AuditEntry]:
