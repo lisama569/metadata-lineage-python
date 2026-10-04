@@ -20,6 +20,38 @@ def _setup_chain(service):
     return refs
 
 
+def _setup_converging(service):
+    """a -> b, a -> c, b -> c：两支在 c 汇合（c 同时是 a 的直接邻居）。
+
+    从 a 出发 max_depth=1 时，边界上的 b 仍挂着 b -> c，但 c 已被直接
+    访问并返回——这是“边界挂边但不构成遗漏”的典型场景。
+    """
+    for name in "abc":
+        service.register_entity(
+            name, name.upper(), [FieldSpec("f", FieldType.INT64)], actor="x")
+    refs = {name: service.resolve_ref(name, "f") for name in "abc"}
+    service.register_lineage(refs["a"], refs["b"], actor="x")
+    service.register_lineage(refs["a"], refs["c"], actor="x")
+    service.register_lineage(refs["b"], refs["c"], actor="x")
+    return refs
+
+
+def _setup_diamond(service):
+    """a -> b, a -> c, b -> d, c -> d：菱形，两路分支在 d 汇合。
+
+    从 a 出发可达 {b, c, d} 恰好 3 个节点。
+    """
+    for name in "abcd":
+        service.register_entity(
+            name, name.upper(), [FieldSpec("f", FieldType.INT64)], actor="x")
+    refs = {name: service.resolve_ref(name, "f") for name in "abcd"}
+    service.register_lineage(refs["a"], refs["b"], actor="x")
+    service.register_lineage(refs["a"], refs["c"], actor="x")
+    service.register_lineage(refs["b"], refs["d"], actor="x")
+    service.register_lineage(refs["c"], refs["d"], actor="x")
+    return refs
+
+
 def test_max_depth_truncates_downstream(service, request):
     refs = _setup_chain(service)
     r = service.impact(refs["a"], max_depth=1)
@@ -135,3 +167,122 @@ def test_truncation_stable_after_breaking_evolution(service, request):
     # 同一张图多次调用：被截断时取到的节点也稳定一致
     assert ([x.entity_id for x in rc.downstream]
             == [x.entity_id for x in rc2.downstream])
+
+
+# ---------------------------------------------------------------------------
+# 截断标志只能在“确实还有未返回节点”时置位
+# ---------------------------------------------------------------------------
+
+def test_max_depth_converging_branch_is_complete(service, request):
+    """分支在第 1 层已汇合：边界上挂着边但没有新节点，必须判完整。"""
+    refs = _setup_converging(service)
+    r = service.impact(refs["a"], max_depth=1)
+    reached = {x.entity_id for x in r.downstream}
+    log_case(request, {
+        "graph": "a->b, a->c, b->c",
+        "input": "impact(a.f, max_depth=1)",
+        "downstream": [x.entity_id for x in r.downstream],
+        "basis": "b 虽在深度边界上且挂着 b->c，但 c 已作为 a 的直接"
+                 "邻居返回，不存在未返回节点",
+        "truncated": r.truncated,
+    })
+    assert reached == {"b", "c"}  # 全部可达节点都已返回
+    assert r.truncated is False
+
+
+def test_max_depth_converging_upstream_is_complete(service, request):
+    """上游侧同一规则：b->c, b->a, c->a 从 b 反向追一层，a 已返回过。"""
+    refs = _setup_converging(service)  # a->b, a->c, b->c
+    r = service.impact(refs["c"], max_depth=1)
+    reached = {x.entity_id for x in r.upstream}
+    log_case(request, {
+        "graph": "a->b, a->c, b->c",
+        "input": "impact(c.f, max_depth=1)",
+        "upstream": [x.entity_id for x in r.upstream],
+        "basis": "c 的直接上游为 {a, b}；b 的上游 a 已经返回过，"
+                 "边界之外没有未返回节点",
+        "truncated": r.truncated,
+    })
+    assert reached == {"a", "b"}
+    assert r.truncated is False
+
+
+def test_max_nodes_equals_reachable_is_complete(service, request):
+    """节点数上限恰好等于全部可达节点数：结果完整，不标截断。"""
+    refs = _setup_diamond(service)  # a 可达 {b,c,d}
+    r = service.impact(refs["a"], max_nodes=3)
+    reached = {x.entity_id for x in r.downstream}
+    log_case(request, {
+        "graph": "a->b, a->c, b->d, c->d",
+        "input": "impact(a.f, max_nodes=3)",
+        "reachable": ["b", "c", "d"],
+        "downstream": [x.entity_id for x in r.downstream],
+        "basis": "max_nodes=3 恰好覆盖全部 3 个可达节点，无遗漏",
+        "truncated": r.truncated,
+    })
+    assert reached == {"b", "c", "d"}
+    assert r.truncated is False
+
+
+def test_max_depth_equal_to_full_depth_complete(service, request):
+    """深度上限恰好等于图的实际深度：最后一层的边只回指已出现节点。"""
+    refs = _setup_diamond(service)  # 最长路径 2 层
+    r = service.impact(refs["a"], max_depth=2)
+    reached = {x.entity_id for x in r.downstream}
+    log_case(request, {
+        "graph": "a->b, a->c, b->d, c->d",
+        "input": "impact(a.f, max_depth=2)",
+        "downstream": [x.entity_id for x in r.downstream],
+        "basis": "第 2 层节点 d 无出边；b/c 指向的 d 已返回，无遗漏",
+        "truncated": r.truncated,
+    })
+    assert reached == {"b", "c", "d"}
+    assert r.truncated is False
+
+
+def test_max_depth_real_truncation_control_case(service, request):
+    """对照组：第 N 层之外确实存在未取到的节点，必须标截断。"""
+    refs = _setup_chain(service)  # a->b->c->d
+    r = service.impact(refs["a"], max_depth=1)
+    log_case(request, {
+        "graph": "a->b->c->d",
+        "input": "impact(a.f, max_depth=1)",
+        "downstream": [x.entity_id for x in r.downstream],
+        "basis": "边界节点 b 有未返回的下游 c（c 又可达 d）",
+        "truncated": r.truncated,
+    })
+    assert [x.entity_id for x in r.downstream] == ["b"]
+    assert r.truncated is True
+
+
+def test_max_nodes_real_truncation_control_case(service, request):
+    """对照组：节点数上限小于可达节点数，且被漏掉的节点真实存在。"""
+    refs = _setup_diamond(service)  # 可达 3 个
+    r = service.impact(refs["a"], max_nodes=2)
+    log_case(request, {
+        "graph": "a->b, a->c, b->d, c->d",
+        "input": "impact(a.f, max_nodes=2)",
+        "downstream": [x.entity_id for x in r.downstream],
+        "basis": "返回 2 个节点后 d 仍未返回（经 b/c 可达）",
+        "truncated": r.truncated,
+    })
+    assert len(r.downstream) == 2
+    assert r.truncated is True
+
+
+def test_complete_results_reproducible_across_calls(service, request):
+    """同一输入多次调用：完整（未截断）结论同样必须稳定一致。"""
+    refs = _setup_converging(service)
+    runs = [service.impact(refs["a"], max_depth=1) for _ in range(5)]
+    signatures = [
+        ([x.entity_id for x in r.upstream],
+         [x.entity_id for x in r.downstream],
+         [e.edge_id for e in r.active_edges], r.truncated)
+        for r in runs
+    ]
+    log_case(request, {
+        "input": "impact(a.f, max_depth=1) x5",
+        "signatures": signatures,
+    })
+    assert len(set(map(str, signatures))) == 1
+    assert signatures[0][3] is False

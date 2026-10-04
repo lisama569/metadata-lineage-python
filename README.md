@@ -37,7 +37,23 @@ uv run pytest tests/test_batch_update.py        # 批量原子更新
 uv run pytest tests/test_impact_limits.py       # 影响分析容量与截断
 uv run pytest tests/test_api.py
 uv run pytest tests/test_api_new_features.py    # 新能力的 HTTP 层行为
+```
 
+截断结论的专项验证集中在 `tests/test_impact_limits.py`，每个用例都会在
+WARNING 日志中打印 `CASE <用例名> | INPUT/EVIDENCE: {...}`，可直接看出该
+场景的图结构、上限参数、返回节点与判定依据：
+
+```bash
+# -s 保留日志输出；可用 -k 只看某一类场景
+uv run pytest tests/test_impact_limits.py -s -k "converging or equals or control"
+```
+
+覆盖的场景包括：上限恰好覆盖全部节点（深度等于图深 / `max_nodes` 等于可达
+节点数）、分支汇合与边界回流（挂着边但无新节点，判完整）、真正截断的对照
+链/菱形图、同一输入 5 次调用结论一致、上限非法仍拒绝、强制演进后悬空边
+不参与传播也不触发截断。
+
+```bash
 # 启动服务并交互式试用
 uv run fastapi dev main.py        # http://127.0.0.1:8000/docs
 ```
@@ -98,7 +114,22 @@ HTTP 同名查询参数）：
 - `max_depth`：沿每个方向最多追多少层（`1` = 仅直接邻居）；
 - `max_nodes`：每个方向最多返回多少个节点；
 - 两个参数都必须是正整数，否则 `VALIDATION_ERROR`（422）；
-- 触到任一上限时结果中 `truncated=true`，未触上限时恒为 `false`；
+- **截断判据（`truncated`）**：只在「确实还有可达节点没有返回出来」时为
+  `true`。遍历结束后，若存在一条当前有效边，其起点已在结果中、终点不在
+  结果中，说明上限挡住了链路上更深处（或其他分支上）真实存在的节点，
+  才标记截断；上下游两侧使用同一判据。
+- **以下情形即使设了上限、边界上还挂着节点，也判为完整（`truncated=false`）**：
+  - 上限完全够用：从该字段出发直接连出去的上下游节点已构成全部可达集合，
+    再往外没有新节点；
+  - 分支汇合：几条分支最终都连到前面已经出现过的节点（如
+    `a->b, a->c, b->c`，从 a 追 1 层时边界节点 b 虽挂着 `b->c`，但 c
+    已经作为 a 的直接邻居返回，没有遗漏）；
+  - `max_nodes` 恰好等于实际可达节点数：返回的节点正好是全部可达节点，
+    只有严格小于（存在没返回出来的节点）才算截断；
+  - `max_depth` 等于图的实际深度：第 N 层节点的下游若都已在前面出现过
+    （回指 / 汇合），同样完整返回；
+- **真正截断的对照场景**：`a->b->c->d` 从 a 设 `max_depth=1`（c/d 未
+  返回）、菱形图从 a 设 `max_nodes=2`（d 未返回）等，均为 `truncated=true`；
 - **截断结论稳定可复现**：遍历按 edge_id 排序的 BFS，同样的输入与同样的图，
   多次调用返回的顺序与内容完全一致（被截断保留的是哪部分也一致）；
 - 结构演进后悬空的边（`active=false`）不参与遍历，既不计入传播、也不触发

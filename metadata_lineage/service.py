@@ -53,9 +53,11 @@ _UNSET = object()
 class ImpactResult:
     """影响分析结论。
 
-    active_edges：当前有效结构上参与传播的边。
+    active_edges：当前有效结构上参与传播的边（结果节点子图内部的边）。
     dangling_edges：因字段被删除（强制演进）而断开的边；不参与遍历，永不静默删除。
-    truncated：是否因触到容量上限（max_depth / max_nodes）而被截断。
+    truncated：是否因容量上限（max_depth / max_nodes）挡住了真实存在但
+        未返回的可达节点。边界节点的边只回指/汇合到已返回节点、或上限
+        恰好覆盖全部可达节点时，结果完整，该标志为 False。
     """
 
     upstream: list[Ref]
@@ -491,8 +493,13 @@ class CatalogService:
 
         - max_depth：沿每个方向最多追多少层（1 = 仅直接邻居）；
         - max_nodes：每个方向最多返回多少个节点。
-        触到任一上限即截断并在结果中标记 truncated=True；遍历顺序按
-        edge_id 排序的 BFS，同样输入多次调用结论一致。悬空边不参与遍历。
+
+        截断判定（truncated）只在“确实还有可达节点没返回”时成立：遍历
+        结束后若存在一条有效边，其起点已在结果中、终点不在结果中，说明
+        上限挡住了真实存在的节点。分支汇合、边界节点的边回指已出现节点等
+        情形不构成遗漏，即使触到上限也判完整；max_nodes 恰好等于全部可达
+        节点数时同样不截断。遍历顺序按 edge_id 排序的 BFS，同样输入多次
+        调用结论一致。悬空边不参与遍历。
         """
         for name, limit in (("max_depth", max_depth), ("max_nodes", max_nodes)):
             if limit is not None and (not isinstance(limit, int) or limit < 1):
@@ -510,37 +517,47 @@ class CatalogService:
         ]
 
         def walk(forward: bool) -> tuple[list[Ref], list[LineageEdge], bool]:
+            def ends(e: LineageEdge) -> tuple[Ref, Ref]:
+                # 正向：沿 src -> dst；反向：沿 dst -> src
+                return (e.src, e.dst) if forward else (e.dst, e.src)
+
             adj: dict[Ref, list[tuple[LineageEdge, Ref]]] = {}
             for e in sorted(active, key=lambda x: x.edge_id):
-                if forward:
-                    adj.setdefault(e.src, []).append((e, e.dst))
-                else:
-                    adj.setdefault(e.dst, []).append((e, e.src))
+                tail, head = ends(e)
+                adj.setdefault(tail, []).append((e, head))
             order: list[Ref] = []
-            used_edges: list[LineageEdge] = []
             seen = {ref}
             queue: deque[tuple[Ref, int]] = deque([(ref, 0)])
-            truncated = False
             while queue:
                 cur, depth = queue.popleft()
                 if max_nodes is not None and len(order) >= max_nodes:
-                    truncated = True  # 队列中仍有未返回的节点
-                    break
-                neighbors = adj.get(cur, [])
+                    break  # 容量已取满：剩余队列不再展开（是否截断事后判定）
                 if max_depth is not None and depth >= max_depth:
-                    if neighbors:
-                        truncated = True  # 更深一层不再展开
-                    continue
-                for edge, nxt in neighbors:
-                    if max_nodes is not None and len(order) >= max_nodes:
-                        truncated = True
-                        break
-                    if edge not in used_edges:
-                        used_edges.append(edge)
+                    continue  # 深度边界：本节点不向外展开
+                for _edge, nxt in adj.get(cur, []):
                     if nxt not in seen:
                         seen.add(nxt)
                         order.append(nxt)
                         queue.append((nxt, depth + 1))
+                        if max_nodes is not None and len(order) >= max_nodes:
+                            break  # 恰好取满 max_nodes 个
+
+            # 截断判据：有效边 tail 已返回而 head 未返回 = 上限挡住了真实
+            # 存在的可达节点。回边 / 指向已出现节点的边（分支汇合、边界
+            # 回流）两端都在 seen 内，不算遗漏；全部可达节点均返回时该
+            # 条件不可能成立。悬空边不在 active 中，永不触发。
+            truncated = False
+            for e in active:
+                tail, head = ends(e)
+                if tail in seen and head not in seen:
+                    truncated = True
+                    break
+
+            # 参与传播的边 = 结果节点子图内部、两端都已返回的有效边
+            used_edges = [
+                e for e in active
+                if ends(e)[0] in seen and ends(e)[1] in seen
+            ]
             return order, used_edges, truncated
 
         upstream, up_edges, up_trunc = walk(forward=False)
