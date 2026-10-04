@@ -135,3 +135,134 @@ def test_truncation_stable_after_breaking_evolution(service, request):
     # 同一张图多次调用：被截断时取到的节点也稳定一致
     assert ([x.entity_id for x in rc.downstream]
             == [x.entity_id for x in rc2.downstream])
+
+
+def _setup_diamond(service):
+    """a.f -> b.f, a.f -> c.f, b.f -> d.f, c.f -> d.f 的钻石形汇合图。"""
+    for name in "abcd":
+        service.register_entity(
+            name, name.upper(), [FieldSpec("f", FieldType.INT64)], actor="x")
+    refs = {name: service.resolve_ref(name, "f") for name in "abcd"}
+    service.register_lineage(refs["a"], refs["b"], actor="x")
+    service.register_lineage(refs["a"], refs["c"], actor="x")
+    service.register_lineage(refs["b"], refs["d"], actor="x")
+    service.register_lineage(refs["c"], refs["d"], actor="x")
+    return refs
+
+
+def _setup_converge(service):
+    """a.f -> b.f, a.f -> c.f, b.f -> c.f：分支汇到已出现的节点。"""
+    for name in "abc":
+        service.register_entity(
+            name, name.upper(), [FieldSpec("f", FieldType.INT64)], actor="x")
+    refs = {name: service.resolve_ref(name, "f") for name in "abc"}
+    service.register_lineage(refs["a"], refs["b"], actor="x")
+    service.register_lineage(refs["a"], refs["c"], actor="x")
+    service.register_lineage(refs["b"], refs["c"], actor="x")
+    return refs
+
+
+def test_max_nodes_exactly_covers_chain_not_truncated(service, request):
+    """节点数上限 == 实际可达节点数：返回全部可达节点且标志为未截断。"""
+    refs = _setup_chain(service)
+    r = service.impact(refs["a"], max_nodes=3)  # 可达节点正好 b/c/d 三个
+    log_case(request, {
+        "input": "impact(a.f, max_nodes=3) on chain a->b->c->d",
+        "reachable_count": 3, "limit": 3,
+        "downstream": [x.entity_id for x in r.downstream],
+        "truncated": r.truncated,
+        "rule": "len(returned) == len(reachable) -> not truncated",
+    })
+    assert [x.entity_id for x in r.downstream] == ["b", "c", "d"]
+    assert r.truncated is False
+
+
+def test_max_nodes_exactly_covers_diamond_not_truncated(service, request):
+    """钻石形汇合：边界节点还挂着边，但出边都汇到已返回节点，不算截断。"""
+    refs = _setup_diamond(service)
+    r = service.impact(refs["a"], max_nodes=3)  # 可达节点正好 b/c/d 三个
+    log_case(request, {
+        "input": "impact(a.f, max_nodes=3) on diamond a->b,a->c,b->d,c->d",
+        "reachable_count": 3, "limit": 3,
+        "downstream": sorted(x.entity_id for x in r.downstream),
+        "truncated": r.truncated,
+        "rule": "frontier edges all converge to returned nodes -> not truncated",
+    })
+    assert sorted(x.entity_id for x in r.downstream) == ["b", "c", "d"]
+    assert r.truncated is False
+
+
+def test_max_depth_boundary_converges_not_truncated(service, request):
+    """深度上限第 N 层节点的下游都已在前面出现过：完整返回，不标截断。"""
+    refs = _setup_converge(service)
+    r = service.impact(refs["a"], max_depth=1)
+    log_case(request, {
+        "input": "impact(a.f, max_depth=1) on a->b,a->c,b->c",
+        "note": "layer-1 node b's only downstream c already returned",
+        "downstream": sorted(x.entity_id for x in r.downstream),
+        "truncated": r.truncated,
+        "rule": "no node beyond depth N is missing -> not truncated",
+    })
+    assert sorted(x.entity_id for x in r.downstream) == ["b", "c"]
+    assert r.truncated is False
+
+
+def test_depth_boundary_converges_upstream_not_truncated(service, request):
+    """上游方向同一规则：第 N 层节点的上游都已在前面出现过，不标截断。"""
+    refs = _setup_converge(service)
+    r = service.impact(refs["c"], max_depth=1)
+    log_case(request, {
+        "input": "impact(c.f, max_depth=1) on a->b,a->c,b->c",
+        "note": "layer-1 node b's only upstream a already returned",
+        "upstream": sorted(x.entity_id for x in r.upstream),
+        "truncated": r.truncated,
+        "rule": "same rule applies to the upstream walk",
+    })
+    assert sorted(x.entity_id for x in r.upstream) == ["a", "b"]
+    assert r.truncated is False
+
+
+def test_diamond_one_extra_node_is_real_truncation(service, request):
+    """对照场景：钻石图之外还有真实后继时，同样上限必须标记截断。"""
+    refs = _setup_diamond(service)
+    service.register_entity("e", "E", [FieldSpec("f", FieldType.INT64)],
+                            actor="x")
+    service.register_lineage(refs["d"], service.resolve_ref("e", "f"),
+                             actor="x")
+    r = service.impact(refs["a"], max_nodes=3)
+    log_case(request, {
+        "input": "impact(a.f, max_nodes=3) on diamond + d->e",
+        "reachable_count": 4, "limit": 3,
+        "downstream": sorted(x.entity_id for x in r.downstream),
+        "truncated": r.truncated,
+        "rule": "len(returned) < len(reachable) -> truncated",
+    })
+    assert sorted(x.entity_id for x in r.downstream) == ["b", "c", "d"]
+    assert r.truncated is True  # e 真的没返回
+
+    r2 = service.impact(refs["a"], max_depth=2)
+    log_case(request, {
+        "input": "impact(a.f, max_depth=2) on diamond + d->e",
+        "note": "e lives at depth 3, beyond the limit",
+        "downstream": sorted(x.entity_id for x in r2.downstream),
+        "truncated": r2.truncated,
+    })
+    assert sorted(x.entity_id for x in r2.downstream) == ["b", "c", "d"]
+    assert r2.truncated is True
+
+
+def test_exact_limit_conclusion_is_repeatable(service, request):
+    """上限恰好覆盖的场景多次调用：节点集与截断标志每次都一致。"""
+    refs = _setup_diamond(service)
+    runs = [service.impact(refs["a"], max_nodes=3, max_depth=2)
+            for _ in range(5)]
+    signatures = [
+        (tuple(x.entity_id for x in r.downstream), r.truncated) for r in runs
+    ]
+    log_case(request, {
+        "input": "impact(a.f, max_nodes=3, max_depth=2) x5 on diamond",
+        "signatures": signatures,
+        "rule": "identical input -> identical conclusion",
+    })
+    assert len(set(signatures)) == 1
+    assert signatures[0][1] is False  # 上限够用，恒为未截断

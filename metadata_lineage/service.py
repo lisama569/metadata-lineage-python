@@ -491,8 +491,10 @@ class CatalogService:
 
         - max_depth：沿每个方向最多追多少层（1 = 仅直接邻居）；
         - max_nodes：每个方向最多返回多少个节点。
-        触到任一上限即截断并在结果中标记 truncated=True；遍历顺序按
-        edge_id 排序的 BFS，同样输入多次调用结论一致。悬空边不参与遍历。
+        truncated=True 当且仅当确实存在可达但未返回的节点（链路更长或
+        分支更多）；上限恰好覆盖全部可达节点、或边界节点的出边都汇到
+        已返回节点上时，不算截断。遍历顺序按 edge_id 排序的 BFS，同样
+        输入多次调用结论一致。悬空边不参与遍历。
         """
         for name, limit in (("max_depth", max_depth), ("max_nodes", max_nodes)):
             if limit is not None and (not isinstance(limit, int) or limit < 1):
@@ -516,24 +518,34 @@ class CatalogService:
                     adj.setdefault(e.src, []).append((e, e.dst))
                 else:
                     adj.setdefault(e.dst, []).append((e, e.src))
+
+            # 全量可达集（不受任何上限约束）：判定截断的唯一依据是
+            # “是否还有可达节点没返回”，而不是“是否摸到了上限”。
+            reachable: set[Ref] = set()
+            seen_all = {ref}
+            queue_all: deque[Ref] = deque([ref])
+            while queue_all:
+                cur = queue_all.popleft()
+                for _edge, nxt in adj.get(cur, []):
+                    if nxt not in seen_all:
+                        seen_all.add(nxt)
+                        reachable.add(nxt)
+                        queue_all.append(nxt)
+
+            # 实际遍历：受 max_depth / max_nodes 约束的 BFS，产出返回
+            # 顺序与参与传播的边。
             order: list[Ref] = []
             used_edges: list[LineageEdge] = []
             seen = {ref}
             queue: deque[tuple[Ref, int]] = deque([(ref, 0)])
-            truncated = False
             while queue:
                 cur, depth = queue.popleft()
                 if max_nodes is not None and len(order) >= max_nodes:
-                    truncated = True  # 队列中仍有未返回的节点
-                    break
-                neighbors = adj.get(cur, [])
+                    break  # 节点额度用完；队列里剩余的都已在 order 中
                 if max_depth is not None and depth >= max_depth:
-                    if neighbors:
-                        truncated = True  # 更深一层不再展开
-                    continue
-                for edge, nxt in neighbors:
+                    continue  # 更深层不再展开
+                for edge, nxt in adj.get(cur, []):
                     if max_nodes is not None and len(order) >= max_nodes:
-                        truncated = True
                         break
                     if edge not in used_edges:
                         used_edges.append(edge)
@@ -541,6 +553,10 @@ class CatalogService:
                         seen.add(nxt)
                         order.append(nxt)
                         queue.append((nxt, depth + 1))
+            # order 是 reachable 的子集：只要还有可达节点没返回才算截断。
+            # 上限恰好等于可达节点数、或边界节点的出边全部汇到已返回
+            # 节点（分支汇合）时，len(order) == len(reachable)，不截断。
+            truncated = len(order) < len(reachable)
             return order, used_edges, truncated
 
         upstream, up_edges, up_trunc = walk(forward=False)
